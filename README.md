@@ -10,6 +10,7 @@
 - **定向门线穿越核算**：围栏内保存简单 GeoJSON LineString 门线（正/反向名称 + 最小位移），只承认相邻轨迹点对门线的**单点横穿**，穿越时刻按交点比例插值
 - **有序门线巡检路线核验**：路线保存 2～8 个按序排列的门线检查点（门线 + 方向 + 与上一点的最长间隔，首点无间隔）；核验设备在 `[start, end)` 窗口内是否按序、按方向且不超间隔地逐点通过，报告实时由当前穿越记录重算
 - **应急清场核验**：为围栏创建含名称、开始时刻、截止时刻的清场任务；报告从 enter/leave 事件实时还原起始在场名单并逐机核验 cleared/remaining
+- **协同到场核验**：为围栏创建 2～8 台设备组成的协同任务（有效窗口 + 最短共同在场时长，设备不得重复）；报告从 enter/leave 事件实时还原各设备半开在场区间，求全体成员共同在场的连续片段，只有窗口内持续达到时长的片段才算通过
 - 按时间范围/设备/围栏/类型查询事件，查询设备当前状态
 
 ## 快速开始（Docker Compose 一键启动）
@@ -392,13 +393,83 @@ curl 'http://localhost:8000/fences/1/inspection-routes/1/report?device_id=dev-00
 8. **实时重建、无快照**：报告**每次查询都从当前穿越记录重放**，不落库任何结果。补录乱序轨迹点（包括更早的点）触发穿越全量重算后，再次查询即按最新穿越结果重算通过时刻与违规判定，不保留旧快照。
 9. `start >= end` 返回 `422`；围栏/路线不存在或路线不属于该围栏返回 `404`。
 
+### 12. 协同到场核验
+
+为围栏创建协同到场任务：**2～8 台**协同设备（设备 ID **不得重复**）、半开有效窗口 `[start_at, end_at)` 与**最短共同在场时长**（秒，正数；持续时长**等于**门槛即算达标）。
+
+```bash
+curl -X POST http://localhost:8000/fences/1/rendezvous-tasks \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "班前集合点名",
+    "members": ["dev-001", "dev-002", "dev-003"],
+    "start_at": "2026-09-30T12:00:00Z",
+    "end_at": "2026-09-30T12:10:00Z",
+    "min_co_presence_s": 120
+  }'
+```
+
+- 创建校验：成员数量必须为 **2～8**；**设备 ID 不得重复、不得为空**（否则 `422`）；窗口必须有效（`start_at < end_at`，否则 `422`）；`min_co_presence_s` 必须为正数（否则 `422`）；围栏不存在返回 `404`。
+- 管理接口：`GET /fences/1/rendezvous-tasks`（按 id 升序，成员按提交顺序）、`DELETE /fences/1/rendezvous-tasks/{task_id}`；**删除围栏时其协同任务与成员一并删除**。
+
+提交三台设备的轨迹（沿用第 1 节围栏，默认配置无缓冲/dwell；`dev-002` 在 12:03 离开、12:04 才返回，把共同在场切成 `12:01–12:03` 与 `12:04–12:05` 两个候选）：
+
+```bash
+curl -X POST http://localhost:8000/points -H 'Content-Type: application/json' \
+  -d '{"points": [
+    {"device_id": "dev-001", "ts": "2026-09-30T11:59:00Z", "lat": 39.910, "lon": 116.310},
+    {"device_id": "dev-001", "ts": "2026-09-30T12:06:00Z", "lat": 39.894, "lon": 116.294},
+    {"device_id": "dev-002", "ts": "2026-09-30T11:59:30Z", "lat": 39.910, "lon": 116.310},
+    {"device_id": "dev-002", "ts": "2026-09-30T12:03:00Z", "lat": 39.894, "lon": 116.294},
+    {"device_id": "dev-002", "ts": "2026-09-30T12:04:00Z", "lat": 39.910, "lon": 116.310},
+    {"device_id": "dev-002", "ts": "2026-09-30T12:06:30Z", "lat": 39.894, "lon": 116.294},
+    {"device_id": "dev-003", "ts": "2026-09-30T12:01:00Z", "lat": 39.910, "lon": 116.310},
+    {"device_id": "dev-003", "ts": "2026-09-30T12:05:00Z", "lat": 39.894, "lon": 116.294}
+  ]}'
+
+curl http://localhost:8000/fences/1/rendezvous-tasks/1/report
+```
+
+返回示例（`dev-002` 中途短暂离开一次，形成两个候选片段，仅达标的第一个保留）：
+
+```json
+{
+  "id": 1,
+  "fence_id": 1,
+  "name": "班前集合点名",
+  "members": ["dev-001", "dev-002", "dev-003"],
+  "start_at": "2026-09-30T12:00:00Z",
+  "end_at": "2026-09-30T12:10:00Z",
+  "min_co_presence_s": 120.0,
+  "created_at": "2026-09-30T11:50:00Z",
+  "passed": true,
+  "segments": [
+    {
+      "start": "2026-09-30T12:01:00Z",
+      "end": "2026-09-30T12:03:00Z",
+      "duration_s": 120.0,
+      "members": ["dev-001", "dev-002", "dev-003"]
+    }
+  ]
+}
+```
+
+**核验语义**：
+
+1. **半开在场区间还原**：报告由该围栏当前的 `enter`/`leave` 事件重放，各设备在场时间一律为半开区间 **`[enter, leave)`**，并截断到有效窗口 `[start_at, end_at)`；窗口前已进入、窗口结束仍未离开的区间正确截断。
+2. **同刻 enter/leave 按半开边界处理**：扫描线在每个时刻先一次性应用该时刻的全部进出（离开先、进入后），再判定下一微小区间——**恰在 `t` 离开的成员不计入 `[t, next)`，恰在 `t` 进入的成员计入**；同一成员同刻离开又进入时，旧区间止端不含 `t`、新区间起端含 `t`，共同在场视为连续不断点。窗口端点沿用同一边界：`start_at` 处的 enter 计入，`end_at` 处的 leave 不算提前离场（片段可取到窗口结束）。
+3. **全体成员 + 反复进出**：片段必须覆盖任务的**全部**成员（任一成员无轨迹或窗口内未到场即无片段）；成员反复进出会形成**多个候选片段**，各自独立计时。
+4. **达标判定**：只有窗口内持续时长 **`>= min_co_presence_s`（含等于）** 的片段才保留，按起止时刻升序返回，每项给出 `start`、`end`、`duration_s`（秒）与 `members`（全体成员，按 ID 排序）；`passed` 仅当存在至少一个达标片段，无达标片段时为 `false` 且 `segments` 为空数组。
+5. **实时重建、无快照**：报告**每次查询都从当前事件重建**，不落库任何结果。补录乱序轨迹点（包括更早的点）触发事件重算后，再次查询即按最新事件重算片段，旧片段不残留。
+6. 围栏/任务不存在或任务不属于该围栏返回 `404`。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/fences` | 创建围栏（GeoJSON Polygon，支持孔洞，附判定配置） |
 | GET | `/fences` / `/fences/{id}` | 围栏列表 / 详情 |
-| DELETE | `/fences/{id}` | 删除围栏及其事件、状态、容量规则、门线、清场任务 |
+| DELETE | `/fences/{id}` | 删除围栏及其事件、状态、容量规则、门线、清场任务、协同任务 |
 | POST | `/points` | 批量提交轨迹点（乱序重排、重复幂等） |
 | GET | `/events` | 事件查询（device_id / fence_id / type / start / end / limit / offset） |
 | GET | `/devices/{device_id}/status` | 设备当前相对各围栏的状态 |
@@ -418,6 +489,10 @@ curl 'http://localhost:8000/fences/1/inspection-routes/1/report?device_id=dev-00
 | GET | `/fences/{id}/clearance-tasks` | 清场任务列表（按 id 升序） |
 | DELETE | `/fences/{id}/clearance-tasks/{task_id}` | 删除清场任务（删除围栏时一并删除） |
 | GET | `/fences/{id}/clearance-tasks/{task_id}/report` | 清场核验报告（实时由事件重建：起始名单 + cleared/remaining + 汇总） |
+| POST | `/fences/{id}/rendezvous-tasks` | 新增协同到场任务（2～8 台不重复设备 + 有效窗口 + 最短共同在场时长） |
+| GET | `/fences/{id}/rendezvous-tasks` | 协同任务列表（按 id 升序，成员按提交顺序） |
+| DELETE | `/fences/{id}/rendezvous-tasks/{task_id}` | 删除协同任务及其成员（删除围栏时一并删除） |
+| GET | `/fences/{id}/rendezvous-tasks/{task_id}/report` | 协同到场报告（实时由事件重建：全员共同在场达标片段起止/秒数/成员 + passed） |
 | GET | `/health` | 健康检查 |
 
 ## 围栏配置参数
@@ -447,11 +522,11 @@ uvicorn app.main:app --reload --port 8000   # 本地启动
 ```
 app/
   main.py      # FastAPI 路由与摄入/重算流程
-  engine.py    # 投影、缓冲迟滞 + dwell 状态机（事件判定核心）、容量占用分段、门线穿越核算、应急清场核验、有序门线巡检路线核验
-  models.py    # SQLAlchemy 模型（fences / points / events / device_state / capacity_rules / gate_lines / crossings / clearance_tasks / inspection_routes / inspection_checkpoints）
+  engine.py    # 投影、缓冲迟滞 + dwell 状态机（事件判定核心）、容量占用分段、门线穿越核算、应急清场核验、有序门线巡检路线核验、协同到场核验
+  models.py    # SQLAlchemy 模型（fences / points / events / device_state / capacity_rules / gate_lines / crossings / clearance_tasks / inspection_routes / inspection_checkpoints / rendezvous_tasks / rendezvous_members）
   schemas.py   # Pydantic 请求/响应模型
   database.py  # SQLite 连接与会话
-tests/         # pytest 端到端测试（孔洞、乱序、幂等、抖动、停留、查询、容量核算、门线穿越、清场核验、巡检路线核验）
+tests/         # pytest 端到端测试（孔洞、乱序、幂等、抖动、停留、查询、容量核算、门线穿越、清场核验、巡检路线核验、协同到场核验）
 Dockerfile / docker-compose.yml
 ```
 

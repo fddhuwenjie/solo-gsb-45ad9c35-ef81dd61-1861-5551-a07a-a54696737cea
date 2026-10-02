@@ -23,6 +23,7 @@ from .engine import (
     compute_events,
     compute_inspection_report,
     compute_occupancy_segments,
+    compute_rendezvous_report,
     project_points,
 )
 from .models import (
@@ -36,6 +37,8 @@ from .models import (
     GateLineRow,
     InspectionCheckpointRow,
     InspectionRouteRow,
+    RendezvousMemberRow,
+    RendezvousTask,
     TrackPointRow,
 )
 from .schemas import (
@@ -64,6 +67,10 @@ from .schemas import (
     OccupancyOut,
     OccupancySegmentOut,
     PointBatch,
+    RendezvousReportOut,
+    RendezvousSegmentOut,
+    RendezvousTaskCreate,
+    RendezvousTaskOut,
 )
 
 # 摄入与重算在进程内串行化，保证同一设备的重算基于一致快照
@@ -91,8 +98,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="轨迹围栏事件 API",
     description="带孔多边形围栏 + 乱序轨迹重排 + 缓冲/停留去抖的 enter/leave/stay 事件服务，"
-                "支持围栏容量核算、定向门线穿越核算与应急清场核验",
-    version="1.4.0",
+                "支持围栏容量核算、定向门线穿越核算、应急清场核验与协同到场核验",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -243,6 +250,15 @@ def delete_fence(fence_id: int, db: Session = Depends(get_db)):
     db.query(Crossing).filter_by(fence_id=fence_id).delete()
     db.query(GateLineRow).filter_by(fence_id=fence_id).delete()
     db.query(ClearanceTask).filter_by(fence_id=fence_id).delete()
+    task_ids = [
+        t[0]
+        for t in db.query(RendezvousTask.id).filter_by(fence_id=fence_id).all()
+    ]
+    if task_ids:
+        db.query(RendezvousMemberRow).filter(
+            RendezvousMemberRow.task_id.in_(task_ids)
+        ).delete(synchronize_session=False)
+    db.query(RendezvousTask).filter_by(fence_id=fence_id).delete()
     route_ids = [
         r[0]
         for r in db.query(InspectionRouteRow.id).filter_by(fence_id=fence_id).all()
@@ -963,6 +979,155 @@ def inspection_route_report(
                 failed_at=to_iso(r.failed_ts),
             )
             for r in report.results
+        ],
+    )
+
+
+# ---------- 协同到场核验 ----------
+
+
+def _rendezvous_members(db: Session, task_id: int) -> list[str]:
+    rows = (
+        db.query(RendezvousMemberRow)
+        .filter_by(task_id=task_id)
+        .order_by(RendezvousMemberRow.position)
+        .all()
+    )
+    return [r.device_id for r in rows]
+
+
+def rendezvous_task_out(db: Session, task: RendezvousTask) -> RendezvousTaskOut:
+    return RendezvousTaskOut(
+        id=task.id,
+        fence_id=task.fence_id,
+        name=task.name,
+        members=_rendezvous_members(db, task.id),
+        start_at=to_iso(task.start_ts),
+        end_at=to_iso(task.end_ts),
+        min_co_presence_s=task.min_co_presence_s,
+        created_at=to_iso(task.created_at),
+    )
+
+
+def _get_rendezvous_task(db: Session, fence_id: int, task_id: int) -> RendezvousTask:
+    task = db.get(RendezvousTask, task_id)
+    if task is None or task.fence_id != fence_id:
+        raise HTTPException(status_code=404, detail="协同任务不存在")
+    return task
+
+
+@app.post(
+    "/fences/{fence_id}/rendezvous-tasks",
+    response_model=RendezvousTaskOut,
+    status_code=201,
+)
+def create_rendezvous_task(
+    fence_id: int, body: RendezvousTaskCreate, db: Session = Depends(get_db)
+):
+    """创建协同到场任务：2～8 台不重复设备 + 有效窗口 + 最短共同在场时长。
+
+    成员数量为 2～8、设备 ID 不得重复、开始时刻必须严格早于结束时刻，
+    最短共同在场时长为正数，否则返回 422；围栏不存在返回 404。
+    """
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    start_ts, end_ts = to_epoch(body.start_at), to_epoch(body.end_at)
+    if not start_ts < end_ts:
+        raise HTTPException(status_code=422, detail="开始时刻必须早于结束时刻")
+
+    task = RendezvousTask(
+        fence_id=fence_id,
+        name=body.name,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        min_co_presence_s=body.min_co_presence_s,
+        created_at=datetime.now(timezone.utc).timestamp(),
+    )
+    db.add(task)
+    db.flush()  # 取得 task.id
+    for position, device_id in enumerate(body.members):
+        db.add(RendezvousMemberRow(
+            task_id=task.id, position=position, device_id=device_id
+        ))
+    db.commit()
+    db.refresh(task)
+    return rendezvous_task_out(db, task)
+
+
+@app.get(
+    "/fences/{fence_id}/rendezvous-tasks",
+    response_model=list[RendezvousTaskOut],
+)
+def list_rendezvous_tasks(fence_id: int, db: Session = Depends(get_db)):
+    """列出围栏的协同到场任务（按 id 升序），成员按提交顺序。"""
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    tasks = (
+        db.query(RendezvousTask)
+        .filter_by(fence_id=fence_id)
+        .order_by(RendezvousTask.id)
+        .all()
+    )
+    return [rendezvous_task_out(db, t) for t in tasks]
+
+
+@app.delete(
+    "/fences/{fence_id}/rendezvous-tasks/{task_id}",
+    status_code=204,
+)
+def delete_rendezvous_task(fence_id: int, task_id: int, db: Session = Depends(get_db)):
+    task = _get_rendezvous_task(db, fence_id, task_id)
+    db.query(RendezvousMemberRow).filter_by(task_id=task.id).delete()
+    db.delete(task)
+    db.commit()
+
+
+@app.get(
+    "/fences/{fence_id}/rendezvous-tasks/{task_id}/report",
+    response_model=RendezvousReportOut,
+)
+def rendezvous_report(fence_id: int, task_id: int, db: Session = Depends(get_db)):
+    """查询协同到场核验报告：每次由当前 enter/leave 事件实时重建，不保留旧结果。
+
+    从事件还原各成员的半开在场区间 [enter, leave) 并截断到有效窗口，
+    按时间扫描全体成员同时在场的连续片段：同刻 enter/leave 按半开边界
+    处理，成员反复进出形成多个候选；只有窗口内持续达到（含）最短共同
+    在场时长的片段才算通过，返回片段起止、持续秒数与成员列表。
+    无达标片段时 passed=false、segments 为空。
+    """
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    task = _get_rendezvous_task(db, fence_id, task_id)
+    members = _rendezvous_members(db, task.id)
+
+    events = (
+        db.query(Event)
+        .filter(
+            Event.fence_id == fence_id,
+            Event.type.in_([EVENT_ENTER, EVENT_LEAVE]),
+            Event.device_id.in_(members),
+        )
+        .all()
+    )
+    report = compute_rendezvous_report(
+        [(e.device_id, e.type, e.ts) for e in events],
+        members,
+        task.start_ts,
+        task.end_ts,
+        task.min_co_presence_s,
+    )
+    base = rendezvous_task_out(db, task).model_dump()
+    return RendezvousReportOut(
+        **base,
+        passed=report.passed,
+        segments=[
+            RendezvousSegmentOut(
+                start=to_iso(s.start),
+                end=to_iso(s.end),
+                duration_s=s.duration_s,
+                members=list(s.members),
+            )
+            for s in report.segments
         ],
     )
 

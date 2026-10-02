@@ -241,3 +241,53 @@ class InspectionReportOut(InspectionRouteOut):
     results: list[InspectionCheckpointResultOut] = Field(
         description="每个检查点的通过时刻或失败原因，按顺序排列"
     )
+
+
+# ---------- 协同到场核验 ----------
+
+
+class RendezvousTaskCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200, description="协同任务名称")
+    members: list[str] = Field(
+        min_length=2, max_length=8, description="协同设备 ID 列表（2～8 台，不得重复）"
+    )
+    start_at: datetime = Field(description="有效窗口开始时刻（ISO 8601），含该时刻")
+    end_at: datetime = Field(description="有效窗口结束时刻（ISO 8601，不含，必须晚于开始")
+    min_co_presence_s: float = Field(
+        gt=0, description="最短共同在场时长（秒，正数）；等于该时长即算达标"
+    )
+
+    @model_validator(mode="after")
+    def check_members_and_window(self):
+        if any(not m.strip() for m in self.members):
+            raise ValueError("设备 ID 不得为空")
+        if len(set(self.members)) != len(self.members):
+            raise ValueError("协同设备 ID 不得重复")
+        if not self.start_at < self.end_at:
+            raise ValueError("开始时刻必须早于结束时刻")
+        return self
+
+
+class RendezvousTaskOut(BaseModel):
+    id: int
+    fence_id: int
+    name: str
+    members: list[str] = Field(description="协同设备 ID（按提交顺序）")
+    start_at: datetime
+    end_at: datetime
+    min_co_presence_s: float
+    created_at: datetime
+
+
+class RendezvousSegmentOut(BaseModel):
+    start: datetime = Field(description="共同在场片段开始时刻（半开，含）")
+    end: datetime = Field(description="共同在场片段结束时刻（半开，不含）")
+    duration_s: float = Field(description="片段持续秒数")
+    members: list[str] = Field(description="共同在场成员（即全部任务成员，按 ID 排序）")
+
+
+class RendezvousReportOut(RendezvousTaskOut):
+    passed: bool = Field(description="是否存在窗口内持续达到最短时长的共同在场片段")
+    segments: list[RendezvousSegmentOut] = Field(
+        description="达标的共同在场连续片段，按起止时刻升序；无达标片段为空数组"
+    )

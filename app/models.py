@@ -123,3 +123,28 @@ class InspectionCheckpointRow(Base):
     max_interval_s: Mapped[float | None] = mapped_column(
         Float, nullable=True
     )  # 与上一检查点的最长间隔（秒）；首点为 None
+
+
+class RendezvousTask(Base):
+    __tablename__ = "rendezvous_tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    fence_id: Mapped[int] = mapped_column(Integer, index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    start_ts: Mapped[float] = mapped_column(Float)        # 有效窗口开始（epoch 秒，含）
+    end_ts: Mapped[float] = mapped_column(Float)          # 有效窗口结束（epoch 秒，不含，须晚于开始）
+    min_co_presence_s: Mapped[float] = mapped_column(Float)  # 最短共同在场时长（秒，正数）
+    created_at: Mapped[float] = mapped_column(Float)
+
+
+class RendezvousMemberRow(Base):
+    __tablename__ = "rendezvous_members"
+    # (task_id, position) 唯一：任务内成员序号唯一；position 从 0 起按提交顺序
+    __table_args__ = (
+        UniqueConstraint("task_id", "position", name="uq_rendezvous_position"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int] = mapped_column(Integer, index=True)
+    position: Mapped[int] = mapped_column(Integer)   # 成员在任务中的序号（0 起）
+    device_id: Mapped[str] = mapped_column(String(100), index=True)

@@ -22,6 +22,12 @@
 方向 + 与上一点的最长间隔，首点无间隔）。在给定设备与 [start, end) 窗口
 上按当前穿越记录时间重放：只有匹配下一个检查点的穿越才推进；当前门线的
 反向穿越或后续门线的穿越立即判顺序违规；超过间隔判超时；其他门线忽略。
+
+协同到场核验：任务指定 2～8 台成员设备、有效窗口 [start, end) 与最短
+共同在场时长。由 enter/leave 事件还原各成员的半开在场区间 [enter, leave)
+并截断到窗口，在合并后的时间边界上扫描全体成员同时在场的连续片段；
+成员反复进出会形成多个候选片段，只有窗口内持续时长达到（含）门槛的片段
+才算通过，任一达标即整体通过，无达标片段即失败。
 """
 from __future__ import annotations
 
@@ -733,4 +739,118 @@ def compute_inspection_report(
         start=start,
         end=end,
         results=results,
+    )
+
+
+# ---------- 协同到场核验 ----------
+
+
+@dataclass
+class RendezvousSegment:
+    """[start, end) 内全体成员共同在场的一个连续片段。"""
+
+    start: float
+    end: float
+    members: tuple[str, ...]  # 全体成员（任务成员按 ID 排序）
+
+    @property
+    def duration_s(self) -> float:
+        return self.end - self.start
+
+
+@dataclass
+class RendezvousReport:
+    """协同到场核验报告：members 为任务成员（按 ID 排序），segments 为达标片段。"""
+
+    start: float
+    end: float
+    min_co_presence_s: float
+    members: tuple[str, ...]
+    segments: list[RendezvousSegment]
+
+    @property
+    def passed(self) -> bool:
+        return len(self.segments) > 0
+
+
+def compute_rendezvous_report(
+    events: list[tuple[str, str, float]],
+    members: list[str],
+    start: float,
+    end: float,
+    min_co_presence_s: float,
+) -> RendezvousReport:
+    """由 enter/leave 事件还原 [start, end) 内全体成员共同在场的连续片段。
+
+    - 直接在事件流上做扫描线，不依赖区间配对：起始状态按
+      #enter(ts<=start) - #leave(ts<=start) > 0 判定（enter@start 计入、
+      leave@start 不计），窗口内每个事件时刻先一次性应用该时刻的全部进出
+      （离开先、进入后），再判定下一微小区间 [t, next_t) 的在场集合。
+    - 因此同刻 enter/leave 严格按半开边界处理——恰在 t 离开的成员不计入
+      [t, next_t)，恰在 t 进入的成员计入；同刻 leave+enter 的成员在
+      [t, next_t) 仍在场（旧区间止端不含 t，新区间起端含 t）。成员反复
+      进出会在窗口边界与事件时刻上切出多个候选片段。
+    - 全体成员同时在场的极大连续片段中，窗口内持续时长 >= min_co_presence_s
+      （等于门槛算达标）的片段才保留，按起止时刻升序返回。无达标片段即失败。
+    """
+    member_set = set(members)
+    ordered_members = tuple(sorted(member_set))
+
+    per_dev_events: dict[str, list[tuple[float, str]]] = {}
+    for dev, etype, ts in events:
+        if dev in member_set and etype in (EVENT_ENTER, EVENT_LEAVE):
+            per_dev_events.setdefault(dev, []).append((ts, etype))
+
+    # 起始状态与窗口内边界：同刻离开先于进入应用（离开计数为负）
+    inside: set[str] = set()
+    boundaries = {start, end}
+    toggles: dict[float, dict[str, int]] = {}
+    for dev, evs in per_dev_events.items():
+        enters = sorted(ts for ts, t in evs if t == EVENT_ENTER)
+        leaves = sorted(ts for ts, t in evs if t == EVENT_LEAVE)
+        if sum(1 for ts in enters if ts <= start) - sum(1 for ts in leaves if ts <= start) > 0:
+            inside.add(dev)
+        for ts in enters:
+            if start < ts < end:
+                toggles.setdefault(ts, {}).setdefault(dev, 0)
+                toggles[ts][dev] += 1
+                boundaries.add(ts)
+        for ts in leaves:
+            if start < ts <= end:
+                toggles.setdefault(ts, {}).setdefault(dev, 0)
+                toggles[ts][dev] -= 1
+                boundaries.add(ts)
+
+    segments: list[RendezvousSegment] = []
+    seg_start: float | None = start if member_set.issubset(inside) else None
+    for t in sorted(boundaries):
+        if t == start:
+            continue  # 起始状态已就位
+        if t == end:
+            if seg_start is not None:
+                if end - seg_start >= min_co_presence_s:
+                    segments.append(RendezvousSegment(seg_start, end, ordered_members))
+            break
+        delta = toggles[t]
+        # 离开优先于进入，严格半开边界
+        for dev, d in delta.items():
+            if d < 0:
+                inside.discard(dev)
+        for dev, d in delta.items():
+            if d > 0:
+                inside.add(dev)
+        all_present = member_set.issubset(inside)
+        if all_present and seg_start is None:
+            seg_start = t
+        elif not all_present and seg_start is not None:
+            if t - seg_start >= min_co_presence_s:
+                segments.append(RendezvousSegment(seg_start, t, ordered_members))
+            seg_start = None
+
+    return RendezvousReport(
+        start=start,
+        end=end,
+        min_co_presence_s=min_co_presence_s,
+        members=ordered_members,
+        segments=segments,
     )
