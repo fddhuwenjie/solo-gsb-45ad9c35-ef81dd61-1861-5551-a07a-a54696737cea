@@ -123,3 +123,30 @@ class InspectionCheckpointRow(Base):
     max_interval_s: Mapped[float | None] = mapped_column(
         Float, nullable=True
     )  # 与上一检查点的最长间隔（秒）；首点为 None
+
+
+class CoattendanceTask(Base):
+    __tablename__ = "coattendance_tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    fence_id: Mapped[int] = mapped_column(Integer, index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    start_ts: Mapped[float] = mapped_column(Float)       # 有效窗口起始（epoch 秒，含）
+    end_ts: Mapped[float] = mapped_column(Float)         # 有效窗口结束（epoch 秒，不含，须晚于起始）
+    min_duration_s: Mapped[float] = mapped_column(Float)  # 最短共同在场时长（秒，正数）
+    created_at: Mapped[float] = mapped_column(Float)
+
+
+class CoattendanceMember(Base):
+    __tablename__ = "coattendance_members"
+    # (task_id, position) 唯一：任务内成员序号唯一，保存提交顺序；
+    # (task_id, device_id) 唯一：同一任务设备 ID 不得重复
+    __table_args__ = (
+        UniqueConstraint("task_id", "position", name="uq_coatt_task_position"),
+        UniqueConstraint("task_id", "device_id", name="uq_coatt_task_device"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int] = mapped_column(Integer, index=True)
+    position: Mapped[int] = mapped_column(Integer)    # 成员在任务中的序号（0 起）
+    device_id: Mapped[str] = mapped_column(String(100), index=True)

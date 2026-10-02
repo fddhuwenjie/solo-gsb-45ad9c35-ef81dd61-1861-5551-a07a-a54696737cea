@@ -22,6 +22,13 @@
 方向 + 与上一点的最长间隔，首点无间隔）。在给定设备与 [start, end) 窗口
 上按当前穿越记录时间重放：只有匹配下一个检查点的穿越才推进；当前门线的
 反向穿越或后续门线的穿越立即判顺序违规；超过间隔判超时；其他门线忽略。
+
+协同到场核验：任务为围栏指定 2～8 台成员设备、有效窗口 [start, end) 与
+最短共同在场时长。由 enter/leave 事件还原各成员的半开在场区间
+[enter, leave)（截断到窗口），按时间扫描所有成员同时在场的连续片段；
+同一时刻的 enter/leave 按半开边界处理（leave 先生效、enter 后生效，
+同刻换人不形成共同在场）。只有持续时长达到阈值的片段才算通过，无达标
+片段即任务失败。
 """
 from __future__ import annotations
 
@@ -733,4 +740,94 @@ def compute_inspection_report(
         start=start,
         end=end,
         results=results,
+    )
+
+
+# ---------- 协同到场核验 ----------
+
+
+@dataclass
+class CoattendanceSegment:
+    """所有成员同时在场的一个连续片段（半开区间 [start, end)）。"""
+
+    start: float
+    end: float
+    members: tuple[str, ...]   # 共同在场成员 ID，已排序
+
+    @property
+    def duration_s(self) -> float:
+        return self.end - self.start
+
+
+@dataclass
+class CoattendanceReport:
+    """协同到场核验报告。"""
+
+    members: tuple[str, ...]
+    start: float
+    end: float
+    min_duration_s: float
+    segments: list[CoattendanceSegment]   # 按时长达标（持续 >= 阈值）的片段，按起始升序
+
+    @property
+    def passed(self) -> bool:
+        return len(self.segments) > 0
+
+
+def compute_coattendance(
+    events: list[tuple[str, str, float]],
+    members: list[str],
+    start: float,
+    end: float,
+    min_duration_s: float,
+) -> CoattendanceReport:
+    """由 enter/leave 事件还原 [start, end) 内所有成员共同在场的连续片段。
+
+    - 各设备的在场区间先由 presence_intervals 还原为半开区间 [enter, leave)，
+      再截断到有效窗口 [start, end)（开着的区间一直延续，越窗部分裁掉）。
+    - 扫描线按区间端点推进：每个边界先处理 leave（在场集合移除）再处理
+      enter（加入），与半开语义一致——同一时刻 A 离开、B 进入时二者不构成
+      共同在场，前后被切成两个片段。
+    - 只有在场集合覆盖**全部成员**的相邻时间段构成候选片段；同一成员反复
+      进出会把共同在场切成多个候选。相邻候选之间理论上必有成员缺口
+      （不会被误合并），这里仍做同集合防御性合并。
+    - 片段持续时长（截断到窗口后）达到 min_duration_s 才算达标；无任何
+      达标片段即核验失败。
+    """
+    member_set = set(members)
+    by_device: dict[str, list[tuple[float, float]]] = {}
+    for device_id, s, e in presence_intervals(events):
+        if device_id in member_set:
+            cs, ce = max(s, start), min(e, end)
+            if cs < ce:
+                by_device.setdefault(device_id, []).append((cs, ce))
+
+    # 边界集合：窗口端点 + 各成员区间端点（截断后）
+    boundaries = {start, end}
+    for ints in by_device.values():
+        for cs, ce in ints:
+            boundaries.add(cs)
+            boundaries.add(ce)
+    ordered = sorted(boundaries)
+
+    segments: list[CoattendanceSegment] = []
+    for a, b in zip(ordered, ordered[1:]):
+        present = tuple(sorted(
+            dev for dev, ints in by_device.items()
+            if any(cs <= a < ce for cs, ce in ints)
+        ))
+        if len(present) != len(member_set):
+            continue
+        if segments and segments[-1].end == a and segments[-1].members == present:
+            segments[-1].end = b
+        else:
+            segments.append(CoattendanceSegment(a, b, present))
+
+    qualified = [seg for seg in segments if seg.duration_s >= min_duration_s]
+    return CoattendanceReport(
+        members=tuple(sorted(member_set)),
+        start=start,
+        end=end,
+        min_duration_s=min_duration_s,
+        segments=qualified,
     )

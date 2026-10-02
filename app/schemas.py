@@ -241,3 +241,50 @@ class InspectionReportOut(InspectionRouteOut):
     results: list[InspectionCheckpointResultOut] = Field(
         description="每个检查点的通过时刻或失败原因，按顺序排列"
     )
+
+
+# ---------- 协同到场核验 ----------
+
+
+class CoattendanceTaskCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200, description="协同任务名称")
+    device_ids: list[str] = Field(
+        min_length=2, max_length=8, description="协同成员设备 ID（2～8 个），不得重复"
+    )
+    start_at: datetime = Field(description="有效窗口起始时刻（ISO 8601，含）")
+    end_at: datetime = Field(description="有效窗口结束时刻（ISO 8601，不含），必须晚于起始时刻")
+    min_duration_s: float = Field(gt=0, description="最短共同在场时长（秒，正数）")
+
+    @model_validator(mode="after")
+    def check_devices_and_window(self):
+        for dev in self.device_ids:
+            if not dev or not dev.strip():
+                raise ValueError("设备 ID 不能为空")
+        if len(set(self.device_ids)) != len(self.device_ids):
+            raise ValueError("设备 ID 不得重复")
+        return self
+
+
+class CoattendanceTaskOut(BaseModel):
+    id: int
+    fence_id: int
+    name: str
+    device_ids: list[str] = Field(description="成员设备 ID，按提交顺序排列")
+    start_at: datetime
+    end_at: datetime
+    min_duration_s: float
+    created_at: datetime
+
+
+class CoattendanceSegmentOut(BaseModel):
+    start: datetime = Field(description="共同在场片段起始时刻（含）")
+    end: datetime = Field(description="共同在场片段结束时刻（不含）")
+    duration_s: float = Field(description="片段持续秒数（>= 任务最短时长）")
+    members: list[str] = Field(description="片段内共同在场成员（按 ID 排序，即全部任务成员）")
+
+
+class CoattendanceReportOut(CoattendanceTaskOut):
+    passed: bool = Field(description="窗口内是否存在持续达到最短时长的全员共同在场片段")
+    segments: list[CoattendanceSegmentOut] = Field(
+        description="达标的共同在场连续片段，按起始时刻升序；无达标片段为空数组"
+    )

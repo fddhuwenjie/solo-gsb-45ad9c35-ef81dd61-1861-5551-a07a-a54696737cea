@@ -19,6 +19,7 @@ from .engine import (
     ProjectedFence,
     TrackPoint,
     compute_clearance,
+    compute_coattendance,
     compute_crossings,
     compute_events,
     compute_inspection_report,
@@ -29,6 +30,8 @@ from .models import (
     Base,
     CapacityRule,
     ClearanceTask,
+    CoattendanceMember,
+    CoattendanceTask,
     Crossing,
     DeviceState,
     Event,
@@ -46,6 +49,10 @@ from .schemas import (
     ClearanceSummaryOut,
     ClearanceTaskCreate,
     ClearanceTaskOut,
+    CoattendanceReportOut,
+    CoattendanceSegmentOut,
+    CoattendanceTaskCreate,
+    CoattendanceTaskOut,
     CrossingOut,
     DeviceStatusOut,
     EventOut,
@@ -91,8 +98,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="轨迹围栏事件 API",
     description="带孔多边形围栏 + 乱序轨迹重排 + 缓冲/停留去抖的 enter/leave/stay 事件服务，"
-                "支持围栏容量核算、定向门线穿越核算与应急清场核验",
-    version="1.4.0",
+                "支持围栏容量核算、定向门线穿越核算、应急清场核验、有序门线巡检路线核验"
+                "与协同到场核验",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -243,6 +251,15 @@ def delete_fence(fence_id: int, db: Session = Depends(get_db)):
     db.query(Crossing).filter_by(fence_id=fence_id).delete()
     db.query(GateLineRow).filter_by(fence_id=fence_id).delete()
     db.query(ClearanceTask).filter_by(fence_id=fence_id).delete()
+    coatt_task_ids = [
+        r[0]
+        for r in db.query(CoattendanceTask.id).filter_by(fence_id=fence_id).all()
+    ]
+    if coatt_task_ids:
+        db.query(CoattendanceMember).filter(
+            CoattendanceMember.task_id.in_(coatt_task_ids)
+        ).delete(synchronize_session=False)
+    db.query(CoattendanceTask).filter_by(fence_id=fence_id).delete()
     route_ids = [
         r[0]
         for r in db.query(InspectionRouteRow.id).filter_by(fence_id=fence_id).all()
@@ -963,6 +980,153 @@ def inspection_route_report(
                 failed_at=to_iso(r.failed_ts),
             )
             for r in report.results
+        ],
+    )
+
+
+# ---------- 协同到场核验 ----------
+
+
+def _get_coattendance_task(db: Session, fence_id: int, task_id: int) -> CoattendanceTask:
+    task = db.get(CoattendanceTask, task_id)
+    if task is None or task.fence_id != fence_id:
+        raise HTTPException(status_code=404, detail="协同任务不存在")
+    return task
+
+
+def coattendance_task_out(db: Session, task: CoattendanceTask) -> CoattendanceTaskOut:
+    members = (
+        db.query(CoattendanceMember)
+        .filter_by(task_id=task.id)
+        .order_by(CoattendanceMember.position)
+        .all()
+    )
+    return CoattendanceTaskOut(
+        id=task.id,
+        fence_id=task.fence_id,
+        name=task.name,
+        device_ids=[m.device_id for m in members],
+        start_at=to_iso(task.start_ts),
+        end_at=to_iso(task.end_ts),
+        min_duration_s=task.min_duration_s,
+        created_at=to_iso(task.created_at),
+    )
+
+
+@app.post(
+    "/fences/{fence_id}/coattendance-tasks",
+    response_model=CoattendanceTaskOut,
+    status_code=201,
+)
+def create_coattendance_task(
+    fence_id: int, body: CoattendanceTaskCreate, db: Session = Depends(get_db)
+):
+    """创建协同到场任务：2～8 台成员设备 + 有效窗口 [start_at, end_at) + 最短共同在场时长。
+
+    成员设备 ID 不得重复（含空串），起始时刻必须严格早于结束时刻。
+    核验报告不固化，查询时由当前 enter/leave 事件实时重建，因此补录乱序
+    轨迹点后再次查询即得到重算后的共同在场片段与通过结论。
+    """
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    start_ts, end_ts = to_epoch(body.start_at), to_epoch(body.end_at)
+    if not start_ts < end_ts:
+        raise HTTPException(status_code=422, detail="有效窗口起始时刻必须早于结束时刻")
+
+    task = CoattendanceTask(
+        fence_id=fence_id,
+        name=body.name,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        min_duration_s=body.min_duration_s,
+        created_at=datetime.now(timezone.utc).timestamp(),
+    )
+    db.add(task)
+    db.flush()  # 取得 task.id
+    for position, device_id in enumerate(body.device_ids):
+        db.add(CoattendanceMember(task_id=task.id, position=position, device_id=device_id))
+    db.commit()
+    db.refresh(task)
+    return coattendance_task_out(db, task)
+
+
+@app.get(
+    "/fences/{fence_id}/coattendance-tasks",
+    response_model=list[CoattendanceTaskOut],
+)
+def list_coattendance_tasks(fence_id: int, db: Session = Depends(get_db)):
+    """列出围栏的协同到场任务（按 id 升序，成员按提交顺序）。"""
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    tasks = (
+        db.query(CoattendanceTask)
+        .filter_by(fence_id=fence_id)
+        .order_by(CoattendanceTask.id)
+        .all()
+    )
+    return [coattendance_task_out(db, t) for t in tasks]
+
+
+@app.delete("/fences/{fence_id}/coattendance-tasks/{task_id}", status_code=204)
+def delete_coattendance_task(fence_id: int, task_id: int, db: Session = Depends(get_db)):
+    task = _get_coattendance_task(db, fence_id, task_id)
+    db.query(CoattendanceMember).filter_by(task_id=task.id).delete()
+    db.delete(task)
+    db.commit()
+
+
+@app.get(
+    "/fences/{fence_id}/coattendance-tasks/{task_id}/report",
+    response_model=CoattendanceReportOut,
+)
+def coattendance_report(fence_id: int, task_id: int, db: Session = Depends(get_db)):
+    """查询协同到场核验报告：每次由当前 enter/leave 事件实时重建，不保留旧快照。
+
+    由事件还原各成员的半开在场区间 [enter, leave) 并截断到有效窗口，
+    按时间扫描全部成员同时在场的连续片段：同刻 enter/leave 按半开边界
+    （leave 先、enter 后）处理，成员反复进出会形成多个候选片段。
+    只有窗口内持续达到最短共同在场时长的片段才算通过，返回其起止、
+    持续秒数与成员列表；无达标片段时 passed=false 且 segments 为空。
+    """
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    task = _get_coattendance_task(db, fence_id, task_id)
+    members = (
+        db.query(CoattendanceMember)
+        .filter_by(task_id=task.id)
+        .order_by(CoattendanceMember.position)
+        .all()
+    )
+    device_ids = [m.device_id for m in members]
+
+    events = (
+        db.query(Event)
+        .filter(
+            Event.fence_id == fence_id,
+            Event.type.in_([EVENT_ENTER, EVENT_LEAVE]),
+            Event.device_id.in_(device_ids),
+        )
+        .all()
+    )
+    report = compute_coattendance(
+        [(e.device_id, e.type, e.ts) for e in events],
+        device_ids,
+        task.start_ts,
+        task.end_ts,
+        task.min_duration_s,
+    )
+    base = coattendance_task_out(db, task).model_dump()
+    return CoattendanceReportOut(
+        **base,
+        passed=report.passed,
+        segments=[
+            CoattendanceSegmentOut(
+                start=to_iso(s.start),
+                end=to_iso(s.end),
+                duration_s=s.duration_s,
+                members=list(s.members),
+            )
+            for s in report.segments
         ],
     )
 
